@@ -1,1 +1,5 @@
 .streamlit/secrets.toml
+__pycache__/
+autopilot_state.json
+alert_counter.json
+portfolio_state.json

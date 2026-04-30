@@ -1,1 +1,6 @@
 fpdf
+pandas
+streamlit
+reportlab
+GitPython
+schedule

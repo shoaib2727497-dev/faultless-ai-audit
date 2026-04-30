@@ -15,8 +15,11 @@ from urllib.error import URLError
 from urllib.request import Request, urlopen
 
 import pandas as pd
+import schedule
 import streamlit as st
 from fpdf import FPDF
+from reportlab.lib.pagesizes import A4
+from reportlab.pdfgen import canvas
 from targets import COMPANY_LIST
 
 
@@ -24,12 +27,15 @@ st.set_page_config(page_title="Faultless AI Audit", page_icon=":mag:", layout="w
 
 STATE_FILE = Path("autopilot_state.json")
 ALERT_COUNTER_FILE = Path("alert_counter.json")
+PORTFOLIO_FILE = Path("portfolio_state.json")
 ADMIN_PASSWORD_HASH = sha256("Deposit70$".encode("utf-8")).hexdigest()
 ADMIN_MAX_ATTEMPTS = 3
 ADMIN_LOCKOUT_MINUTES = 15
 ADMIN_RATE_LIMIT_WINDOW_SECONDS = 60
 ADMIN_RATE_LIMIT_MAX_REQUESTS = 15
-AUTO_PILOT_INTERVAL_SECONDS = 60
+AUTOPILOT_EVERY_HOURS = 12
+SUBSCRIPTION_URL = "https://faultless-ai-audit.example.com/subscribe"
+WEBSITE_LINK = "https://faultless-ai-audit.example.com"
 
 TARGETS = [
     "google.com", "amazon.com", "microsoft.com", "apple.com", "meta.com",
@@ -56,6 +62,64 @@ def load_json_file(path: Path, default: dict) -> dict:
 
 def save_json_file(path: Path, data: dict) -> None:
     path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+
+def update_live_portfolio(findings_df: pd.DataFrame, source: str) -> None:
+    portfolio = load_json_file(PORTFOLIO_FILE, {"last_updated": None, "audited_companies": [], "high_critical_bugs": []})
+    audited_companies = set(portfolio.get("audited_companies", []))
+    for recipient in COMPANY_LIST:
+        if recipient.strip():
+            audited_companies.add(recipient.strip())
+
+    high_critical = findings_df[findings_df["severity"].isin(["High", "Critical"])] if not findings_df.empty else pd.DataFrame()
+    bug_entries = portfolio.get("high_critical_bugs", [])
+    for _, row in high_critical.head(30).iterrows():
+        bug_entries.append(
+            {
+                "source": source,
+                "severity": row["severity"],
+                "issue": row["issue"],
+                "file": row["file"],
+                "timestamp": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"),
+            }
+        )
+
+    portfolio["audited_companies"] = sorted(audited_companies)
+    portfolio["high_critical_bugs"] = bug_entries[-100:]
+    portfolio["last_updated"] = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+    save_json_file(PORTFOLIO_FILE, portfolio)
+
+
+def get_live_portfolio() -> dict:
+    return load_json_file(
+        PORTFOLIO_FILE,
+        {"last_updated": None, "audited_companies": [], "high_critical_bugs": [], "wall_of_fame": []},
+    )
+
+
+def record_wall_of_fame(company_name: str, bug_type: str) -> None:
+    portfolio = get_live_portfolio()
+    wall = portfolio.get("wall_of_fame", [])
+    wall.append(
+        {
+            "company_name": company_name,
+            "bug_type": bug_type,
+            "status": "Report Sent",
+            "timestamp": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"),
+        }
+    )
+    portfolio["wall_of_fame"] = wall[-100:]
+    portfolio["last_updated"] = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+    save_json_file(PORTFOLIO_FILE, portfolio)
+
+
+def extract_company_name(email_or_domain: str) -> str:
+    value = (email_or_domain or "").strip().lower()
+    if "@" in value:
+        value = value.split("@", 1)[1]
+    if "." in value:
+        value = value.split(".", 1)[0]
+    return value.replace("-", " ").replace("_", " ").title() or "Target Company"
 
 
 def get_autopilot_state() -> dict:
@@ -149,6 +213,7 @@ def scan_target(domain: str) -> list[dict]:
                         "file": domain,
                         "category": "Security",
                         "issue": f"Non-healthy HTTPS response ({status_code})",
+                        "severity": "Medium",
                         "line": 0,
                         "snippet": f"{url} returned HTTP {status_code}",
                     }
@@ -162,6 +227,7 @@ def scan_target(domain: str) -> list[dict]:
                             "file": domain,
                             "category": "Security",
                             "issue": f"Missing recommended security header: {hdr}",
+                            "severity": "Low",
                             "line": 0,
                             "snippet": f"{url} missing `{hdr}`",
                         }
@@ -172,6 +238,7 @@ def scan_target(domain: str) -> list[dict]:
                 "file": domain,
                 "category": "Security",
                 "issue": "Target unreachable over HTTPS",
+                "severity": "High",
                 "line": 0,
                 "snippet": str(exc)[:250],
             }
@@ -182,6 +249,7 @@ def scan_target(domain: str) -> list[dict]:
                 "file": domain,
                 "category": "Security",
                 "issue": "Monitoring check failed",
+                "severity": "Medium",
                 "line": 0,
                 "snippet": str(exc)[:250],
             }
@@ -207,15 +275,70 @@ def add_subscription_message_if_needed(company_key: str, body: str) -> str:
     return body
 
 
-def send_alert_email(subject: str, body: str, company_key: str) -> tuple[bool, str]:
+def generate_professional_security_pdf(findings_df: pd.DataFrame, source: str, company_name: str) -> bytes:
+    high_df = findings_df[findings_df["severity"].isin(["High", "Critical"])] if not findings_df.empty else pd.DataFrame()
+    buffer = io.BytesIO()
+    pdf = canvas.Canvas(buffer, pagesize=A4)
+    width, height = A4
+    y = height - 50
+
+    pdf.saveState()
+    pdf.setFont("Helvetica-Bold", 50)
+    pdf.setFillGray(0.90)
+    pdf.translate(width / 2, height / 2)
+    pdf.rotate(45)
+    pdf.drawCentredString(0, 0, "CONFIDENTIAL")
+    pdf.restoreState()
+
+    pdf.setFont("Helvetica-Bold", 16)
+    pdf.drawString(40, y, "Faultless AI Audit - Security Incident Report")
+    y -= 20
+    pdf.setFont("Helvetica", 10)
+    pdf.drawString(40, y, f"Generated: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}")
+    y -= 16
+    pdf.drawString(40, y, f"Company: {company_name}")
+    y -= 16
+    pdf.drawString(40, y, f"Source: {source}")
+    y -= 16
+    pdf.drawString(40, y, f"High/Critical findings: {len(high_df)}")
+    y -= 20
+    pdf.drawString(40, y, f"Subscription: {SUBSCRIPTION_URL}")
+    y -= 24
+
+    if high_df.empty:
+        pdf.setFont("Helvetica-Bold", 11)
+        pdf.drawString(40, y, "No High or Critical findings in this cycle.")
+    else:
+        for idx, row in high_df.iterrows():
+            if y < 80:
+                pdf.showPage()
+                y = height - 50
+            pdf.setFont("Helvetica-Bold", 10)
+            pdf.drawString(40, y, f"{idx + 1}. [{row['severity']}] {row['issue']}")
+            y -= 14
+            pdf.setFont("Helvetica", 9)
+            pdf.drawString(50, y, f"Target/File: {row['file']} | Line: {row['line']}")
+            y -= 12
+            snippet = str(row["snippet"])[:120]
+            pdf.drawString(50, y, f"Snippet: {snippet}")
+            y -= 18
+
+    pdf.save()
+    buffer.seek(0)
+    return buffer.read()
+
+
+def send_alert_email(subject: str, body: str, company_key: str, findings_df: pd.DataFrame, source: str) -> tuple[bool, str]:
     settings = get_email_settings()
     if not smtp_ready(settings):
         return False, "SMTP/email environment variables are not fully configured."
 
-    final_body = add_subscription_message_if_needed(company_key, body)
     recipients_list = [email.strip() for email in COMPANY_LIST if email.strip()]
     if not recipients_list:
         return False, "COMPANY_LIST is empty. Add at least one recipient in targets.py."
+    high_critical_df = findings_df[findings_df["severity"].isin(["High", "Critical"])] if not findings_df.empty else pd.DataFrame()
+    default_bug_type = str(high_critical_df.iloc[0]["issue"]) if not high_critical_df.empty else "Security Finding"
+    default_severity = str(high_critical_df.iloc[0]["severity"]) if not high_critical_df.empty else "Medium"
 
     try:
         context = ssl.create_default_context()
@@ -223,13 +346,40 @@ def send_alert_email(subject: str, body: str, company_key: str) -> tuple[bool, s
             server.starttls(context=context)
             server.login(settings["smtp_user"], settings["smtp_pass"])
             for company_email in recipients_list:
+                company_name = extract_company_name(company_email)
+                bug_type = default_bug_type
+                severity_level = default_severity
+                dynamic_subject = (
+                    f"[URGENT] Security Vulnerability Assessment Report - {company_name} - Faultless AI Audit"
+                )
+                template_body = (
+                    f"Dear Security Team at {company_name},\n"
+                    "My name is Muhammad Awais, a Senior Security Researcher at Faultless AI Audit. "
+                    f"Our autonomous system has detected a {severity_level} vulnerability ({bug_type}) "
+                    "in your infrastructure. A detailed PDF report is attached.\n"
+                    f"Verify our work at: {WEBSITE_LINK}\n"
+                    "To secure your systems 24/7, subscribe to our Premium Guardian Plan on our website."
+                )
+                final_template_body = add_subscription_message_if_needed(
+                    company_key=f"{company_key}:{company_email}",
+                    body=template_body,
+                )
                 msg = EmailMessage()
-                msg["Subject"] = subject
+                msg["Subject"] = dynamic_subject
                 msg["From"] = settings["from_email"]
                 msg["To"] = company_email
                 msg["Cc"] = settings["cc_email"]  # Dual notification: always carbon-copy user.
-                msg.set_content(final_body)
+                msg.set_content(final_template_body)
+                if not high_critical_df.empty:
+                    pdf_attachment = generate_professional_security_pdf(findings_df, source, company_name)
+                    msg.add_attachment(
+                        pdf_attachment,
+                        maintype="application",
+                        subtype="pdf",
+                        filename="faultless_ai_high_critical_report.pdf",
+                    )
                 server.send_message(msg, to_addrs=[company_email, settings["cc_email"]])
+                record_wall_of_fame(company_name=company_name, bug_type=bug_type)
         return True, f"Alert email sent to {len(recipients_list)} company recipients."
     except Exception as exc:
         return False, f"Failed to send email: {exc}"
@@ -241,37 +391,52 @@ def format_alert_body(findings_df: pd.DataFrame, source: str) -> str:
         f"Source: {source}",
         f"Timestamp: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}",
         f"Total findings: {len(findings_df)}",
+        f"High/Critical findings: {int(findings_df['severity'].isin(['High', 'Critical']).sum()) if not findings_df.empty else 0}",
         "",
         "Top findings:",
     ]
     preview = findings_df.head(15)
     for _, row in preview.iterrows():
         lines.append(
-            f"- [{row['category']}] {row['issue']} | file/target={row['file']} | line={row['line']} | {row['snippet']}"
+            f"- [{row['severity']}] [{row['category']}] {row['issue']} | file/target={row['file']} | line={row['line']} | {row['snippet']}"
         )
     return "\n".join(lines)
 
 
+def run_autopilot_cycle() -> None:
+    state = get_autopilot_state()
+    if not state.get("enabled", True):
+        return
+
+    all_findings = []
+    for domain in TARGETS:
+        all_findings.extend(scan_target(domain))
+
+    if all_findings:
+        df = pd.DataFrame(all_findings)
+    else:
+        df = pd.DataFrame(columns=["file", "category", "issue", "severity", "line", "snippet"])
+
+    update_live_portfolio(df, source="scheduled monitor")
+
+    if not df.empty:
+        subject = f"[AUTO-ALERT] Faultless AI Audit detected {len(df)} issue(s)"
+        body = format_alert_body(df, source="12-hour scheduled monitor")
+        send_alert_email(subject, body, company_key="global_targets", findings_df=df, source="12-hour scheduled monitor")
+        state["last_status"] = f"Alerts sent for {len(df)} findings"
+    else:
+        state["last_status"] = "No issues in latest scheduled cycle"
+
+    state["last_run"] = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+    save_json_file(STATE_FILE, state)
+
+
 def autopilot_loop() -> None:
+    run_autopilot_cycle()
+    schedule.every(AUTOPILOT_EVERY_HOURS).hours.do(run_autopilot_cycle)
     while True:
-        state = get_autopilot_state()
-        if state.get("enabled", True):
-            all_findings = []
-            for domain in TARGETS:
-                all_findings.extend(scan_target(domain))
-
-            if all_findings:
-                df = pd.DataFrame(all_findings)
-                subject = f"[AUTO-ALERT] Faultless AI Audit detected {len(df)} issue(s)"
-                body = format_alert_body(df, source="24/7 target monitor")
-                send_alert_email(subject, body, company_key="global_targets")
-                state["last_status"] = f"Alerts sent for {len(df)} findings"
-            else:
-                state["last_status"] = "No issues in latest auto cycle"
-            state["last_run"] = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
-            save_json_file(STATE_FILE, state)
-
-        time.sleep(AUTO_PILOT_INTERVAL_SECONDS)
+        schedule.run_pending()
+        time.sleep(5)
 
 
 @st.cache_resource
@@ -292,22 +457,24 @@ def decode_bytes(content: bytes) -> str:
 
 
 def scan_security(text: str) -> list[dict]:
-    """Scan for possible hardcoded credentials and API keys."""
+    """Scan for hardcoded credentials and secret-like patterns."""
     findings = []
     patterns = [
-        ("Hardcoded password", r"(?i)\b(password|passwd|pwd)\s*[:=]\s*['\"][^'\"]{4,}['\"]"),
-        ("Hardcoded API key", r"(?i)\b(api[_-]?key|token|secret)\s*[:=]\s*['\"][A-Za-z0-9_\-]{8,}['\"]"),
-        ("AWS Access Key", r"\bAKIA[0-9A-Z]{16}\b"),
+        ("Hardcoded password", "High", r"(?i)\b(password|passwd|pwd)\s*[:=]\s*['\"][^'\"]{4,}['\"]"),
+        ("Hardcoded API key", "Critical", r"(?i)\b(api[_-]?key|token|secret)\s*[:=]\s*['\"][A-Za-z0-9_\-]{8,}['\"]"),
+        ("AWS Access Key", "Critical", r"\bAKIA[0-9A-Z]{16}\b"),
+        ("GitHub token pattern", "Critical", r"\bghp_[A-Za-z0-9]{30,}\b"),
     ]
 
     lines = text.splitlines()
     for line_no, line in enumerate(lines, start=1):
-        for issue_type, pattern in patterns:
+        for issue_type, severity, pattern in patterns:
             if re.search(pattern, line):
                 findings.append(
                     {
                         "category": "Security",
                         "issue": issue_type,
+                        "severity": severity,
                         "line": line_no,
                         "snippet": line.strip()[:200],
                     }
@@ -327,6 +494,7 @@ def scan_logic(text: str) -> list[dict]:
                 {
                     "category": "Logic",
                     "issue": "Possible division by zero",
+                    "severity": "Medium",
                     "line": line_no,
                     "snippet": stripped[:200],
                 }
@@ -336,8 +504,62 @@ def scan_logic(text: str) -> list[dict]:
                 {
                     "category": "Logic",
                     "issue": "Possible floor division by zero",
+                    "severity": "Medium",
                     "line": line_no,
                     "snippet": stripped[:200],
+                }
+            )
+    return findings
+
+
+def scan_sql_injection(text: str) -> list[dict]:
+    """Detect likely SQL injection-prone query construction."""
+    findings = []
+    patterns = [
+        ("SQL query built with string concatenation", "Critical", r"(?i)(select|insert|update|delete).*(\+|%s|f\")"),
+        ("SQL query built via format()", "High", r"(?i)(select|insert|update|delete).*(\.format\()"),
+        ("Unsanitized SQL execution", "High", r"(?i)\.execute\(\s*f?[\"'].*\{.*\}"),
+    ]
+
+    for line_no, line in enumerate(text.splitlines(), start=1):
+        for issue, severity, pattern in patterns:
+            if re.search(pattern, line):
+                findings.append(
+                    {
+                        "category": "Security",
+                        "issue": issue,
+                        "severity": severity,
+                        "line": line_no,
+                        "snippet": line.strip()[:200],
+                    }
+                )
+    return findings
+
+
+def scan_insecure_dependencies(text: str) -> list[dict]:
+    """Flag potentially insecure dependency pins in requirements-like files."""
+    findings = []
+    rules = {
+        "django": ("4.2.0", "High"),
+        "flask": ("2.2.0", "High"),
+        "requests": ("2.31.0", "Medium"),
+        "pyyaml": ("6.0.0", "High"),
+    }
+    version_re = re.compile(r"^\s*([A-Za-z0-9_\-]+)\s*==\s*([0-9][A-Za-z0-9\.\-]*)", re.IGNORECASE)
+    for line_no, line in enumerate(text.splitlines(), start=1):
+        match = version_re.match(line)
+        if not match:
+            continue
+        pkg = match.group(1).lower()
+        version = match.group(2)
+        if pkg in rules and version < rules[pkg][0]:
+            findings.append(
+                {
+                    "category": "Dependency",
+                    "issue": f"Potential insecure dependency: {pkg}=={version}",
+                    "severity": rules[pkg][1],
+                    "line": line_no,
+                    "snippet": line.strip()[:200],
                 }
             )
     return findings
@@ -441,6 +663,27 @@ def main() -> None:
 
     st.title("Faultless AI Audit")
     st.caption("Professional static code audit with instant detection and auto-pilot alerts.")
+    portfolio = get_live_portfolio()
+
+    with st.container(border=True):
+        st.subheader("Live Security Portfolio")
+        st.write(f"Last updated: {portfolio.get('last_updated') or 'Not available'}")
+        pcol1, pcol2 = st.columns(2)
+        pcol1.metric("Companies Audited", len(portfolio.get("audited_companies", [])))
+        pcol2.metric("High/Critical Bugs Logged", len(portfolio.get("high_critical_bugs", [])))
+        if portfolio.get("audited_companies"):
+            st.caption("Audited companies/targets")
+            st.code(", ".join(portfolio["audited_companies"][:20]), language="text")
+        if portfolio.get("high_critical_bugs"):
+            st.dataframe(pd.DataFrame(portfolio["high_critical_bugs"][-10:]), use_container_width=True, hide_index=True)
+
+    with st.container(border=True):
+        st.subheader("Wall of Fame")
+        wall = portfolio.get("wall_of_fame", [])
+        if wall:
+            st.dataframe(pd.DataFrame(wall[-15:]), use_container_width=True, hide_index=True)
+        else:
+            st.caption("No successful report deliveries logged yet.")
 
     # Hidden Admin Dashboard access gate.
     with st.sidebar:
@@ -540,18 +783,22 @@ def main() -> None:
             for fname, text in extracted_files:
                 security_findings = scan_security(text)
                 logic_findings = scan_logic(text)
+                sql_injection_findings = scan_sql_injection(text)
+                dependency_findings = scan_insecure_dependencies(text)
 
-                for finding in security_findings + logic_findings:
+                for finding in security_findings + logic_findings + sql_injection_findings + dependency_findings:
                     finding["file"] = fname
                     all_findings.append(finding)
 
             findings_df = pd.DataFrame(all_findings)
             if not findings_df.empty:
                 findings_df = findings_df[
-                    ["file", "category", "issue", "line", "snippet"]
-                ].sort_values(by=["category", "file", "line"], ascending=[True, True, True])
+                    ["file", "category", "severity", "issue", "line", "snippet"]
+                ].sort_values(by=["severity", "category", "file", "line"], ascending=[True, True, True, True])
             else:
-                findings_df = pd.DataFrame(columns=["file", "category", "issue", "line", "snippet"])
+                findings_df = pd.DataFrame(columns=["file", "category", "severity", "issue", "line", "snippet"])
+
+            update_live_portfolio(findings_df, source="manual upload audit")
 
         st.success(f"Audit complete. Files analyzed: {total_files}")
 
@@ -559,8 +806,8 @@ def main() -> None:
         col1.metric("Files Analyzed", total_files)
         col2.metric("Total Findings", len(findings_df))
         col3.metric(
-            "Security Findings",
-            int((findings_df["category"] == "Security").sum()) if not findings_df.empty else 0,
+            "High/Critical Findings",
+            int(findings_df["severity"].isin(["High", "Critical"]).sum()) if not findings_df.empty else 0,
         )
 
         st.subheader("Audit Findings")
@@ -570,7 +817,13 @@ def main() -> None:
             st.dataframe(findings_df, use_container_width=True, hide_index=True)
             subject = f"[INSTANT ALERT] Faultless AI Audit detected {len(findings_df)} issue(s)"
             body = format_alert_body(findings_df, source="uploaded code scan")
-            email_ok, email_msg = send_alert_email(subject, body, company_key="uploaded_scan")
+            email_ok, email_msg = send_alert_email(
+                subject,
+                body,
+                company_key="uploaded_scan",
+                findings_df=findings_df,
+                source="uploaded code scan",
+            )
             if email_ok:
                 st.success("Instant auto-alert sent to company email with CC to your email.")
             else:
