@@ -17,6 +17,7 @@ from urllib.request import Request, urlopen
 import pandas as pd
 import streamlit as st
 from fpdf import FPDF
+from targets import COMPANY_LIST
 
 
 st.set_page_config(page_title="Faultless AI Audit", page_icon=":mag:", layout="wide")
@@ -124,13 +125,12 @@ def get_email_settings() -> dict:
         "smtp_user": read_setting("SMTP_USER"),
         "smtp_pass": read_setting("SMTP_PASS"),
         "from_email": read_setting("ALERT_FROM_EMAIL"),
-        "company_email": read_setting("COMPANY_ALERT_EMAIL"),
         "cc_email": read_setting("MY_CC_EMAIL"),
     }
 
 
 def smtp_ready(settings: dict) -> bool:
-    required = ["smtp_host", "smtp_port", "smtp_user", "smtp_pass", "from_email", "company_email", "cc_email"]
+    required = ["smtp_host", "smtp_port", "smtp_user", "smtp_pass", "from_email", "cc_email"]
     return all(settings.get(key) for key in required)
 
 
@@ -213,23 +213,24 @@ def send_alert_email(subject: str, body: str, company_key: str) -> tuple[bool, s
         return False, "SMTP/email environment variables are not fully configured."
 
     final_body = add_subscription_message_if_needed(company_key, body)
-
-    msg = EmailMessage()
-    msg["Subject"] = subject
-    msg["From"] = settings["from_email"]
-    msg["To"] = settings["company_email"]
-    msg["Cc"] = settings["cc_email"]  # Dual notification: always carbon-copy user.
-    msg.set_content(final_body)
-
-    recipients = [settings["company_email"], settings["cc_email"]]
+    recipients_list = [email.strip() for email in COMPANY_LIST if email.strip()]
+    if not recipients_list:
+        return False, "COMPANY_LIST is empty. Add at least one recipient in targets.py."
 
     try:
         context = ssl.create_default_context()
         with smtplib.SMTP(settings["smtp_host"], settings["smtp_port"], timeout=15) as server:
             server.starttls(context=context)
             server.login(settings["smtp_user"], settings["smtp_pass"])
-            server.send_message(msg, to_addrs=recipients)
-        return True, "Alert email sent successfully."
+            for company_email in recipients_list:
+                msg = EmailMessage()
+                msg["Subject"] = subject
+                msg["From"] = settings["from_email"]
+                msg["To"] = company_email
+                msg["Cc"] = settings["cc_email"]  # Dual notification: always carbon-copy user.
+                msg.set_content(final_body)
+                server.send_message(msg, to_addrs=[company_email, settings["cc_email"]])
+        return True, f"Alert email sent to {len(recipients_list)} company recipients."
     except Exception as exc:
         return False, f"Failed to send email: {exc}"
 
